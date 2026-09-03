@@ -20,10 +20,14 @@ class LinuxRuntime(private val context: Context) {
 
     companion object {
         private const val TAG = "LinuxRuntime"
+        private const val BOOTSTRAP_ASSET = "flutter_assets/assets/bootstrap-aarch64.zip"
         private const val BOOTSTRAP_MARKER = ".bootstrap_extracted"
         private const val SHEBANG_MARKER = ".relocated_text_paths_v3"
         private const val ELF_PATCH_MARKER = ".elf_runpaths_patched"
         private const val DE_MARKER = ".de_installed"
+        private const val SYSTEM_LINKER_64 = "/system/bin/linker64"
+        private const val TERMUX_EXEC_DIRECT_PRELOAD = "libtermux-exec-direct-ld-preload.so"
+        private const val TERMUX_EXEC_LINKER_PRELOAD = "libtermux-exec-linker-ld-preload.so"
 
         // ELF64 constants
         private const val ELFMAG0: Byte = 0x7f
@@ -94,6 +98,46 @@ class LinuxRuntime(private val context: Context) {
     private fun normalizedDesktop(desktopEnv: String): String = when (desktopEnv.lowercase()) {
         "lxqt", "mate", "kde", "xfce4" -> desktopEnv.lowercase()
         else -> "xfce4"
+    }
+
+    /**
+     * Apps targeting Android 10 or newer cannot exec an ELF stored in their
+     * writable data directory. The Android system linker remains executable,
+     * so Termux launches the ELF through linker64 and intercepts subsequent
+     * execve() calls with its linker-aware preload library.
+     */
+    private fun usesSystemLinkerExec(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
+    private fun termuxCommand(executable: File, arguments: List<String>): List<String> {
+        check(executable.isFile) { "Executable not found: ${executable.absolutePath}" }
+        if (!usesSystemLinkerExec()) {
+            return listOf(executable.absolutePath) + arguments
+        }
+
+        val linker = File(SYSTEM_LINKER_64)
+        check(linker.isFile) { "Android 64-bit system linker not found at $SYSTEM_LINKER_64" }
+        return listOf(linker.absolutePath, executable.absolutePath) + arguments
+    }
+
+    private fun termuxProcessBuilder(
+        executable: File,
+        arguments: List<String>,
+        includeSocketHook: Boolean = true,
+    ): ProcessBuilder {
+        if (usesSystemLinkerExec()) {
+            ensureTermuxExecLinkerPreload(context)
+            check(File(libDir, TERMUX_EXEC_LINKER_PRELOAD).isFile) {
+                "The Android 10+ Termux exec preload could not be installed"
+            }
+        }
+        return ProcessBuilder(termuxCommand(executable, arguments)).also { builder ->
+            builder.environment().clear()
+            builder.environment().putAll(getTermuxEnv(includeSocketHook))
+            // linker64 becomes /proc/self/exe. Patched Termux packages use this
+            // marker when they need the path of the program actually launched.
+            builder.environment()["TERMUX_EXEC__PROC_SELF_EXE"] = executable.absolutePath
+        }
     }
 
     // ── Status ──
@@ -249,6 +293,7 @@ class LinuxRuntime(private val context: Context) {
             wrapDpkgForPath()
             wrapUpdateAlternatives()
             ensureSocketHookPrebuilt()
+            ensureTermuxExecLinkerPreload(context)
             return
         }
 
@@ -266,12 +311,11 @@ class LinuxRuntime(private val context: Context) {
         prefixDir.mkdirs()
 
         // Flutter assets are located under "flutter_assets/" in the APK asset tree
-        val assetName = "flutter_assets/assets/bootstrap-aarch64.zip"
         val tmpZip = File(tmpDir, "bootstrap-aarch64.zip")
         tmpZip.parentFile?.mkdirs()
 
         try {
-            context.assets.open(assetName).use { input ->
+            context.assets.open(BOOTSTRAP_ASSET).use { input ->
                 tmpZip.outputStream().use { output ->
                     input.copyTo(output)
                 }
@@ -306,10 +350,43 @@ class LinuxRuntime(private val context: Context) {
 
         // Copy prebuilt socket hook from jniLibs to prefix/lib
         ensureSocketHookPrebuilt()
+        ensureTermuxExecLinkerPreload(context)
 
         marker.writeText("DroidDesk native bootstrap\n")
         tmpZip.delete()
         Log.i(TAG, "Bootstrap extraction complete")
+    }
+
+    /** Restores the API 29+ exec shim when upgrading an older installation. */
+    private fun ensureTermuxExecLinkerPreload(assetContext: Context) {
+        val destination = File(libDir, TERMUX_EXEC_LINKER_PRELOAD)
+        if (destination.isFile) return
+        val temporary = File(libDir, "$TERMUX_EXEC_LINKER_PRELOAD.installing")
+
+        try {
+            temporary.delete()
+            assetContext.assets.open(BOOTSTRAP_ASSET).use { input ->
+                ZipInputStream(input).use { zip ->
+                    var entry = zip.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory && entry.name == "lib/$TERMUX_EXEC_LINKER_PRELOAD") {
+                            destination.parentFile?.mkdirs()
+                            temporary.outputStream().use { output -> zip.copyTo(output) }
+                            check(temporary.renameTo(destination)) {
+                                "Could not install ${destination.absolutePath}"
+                            }
+                            Log.i(TAG, "Restored Android 10+ Termux exec preload library")
+                            return
+                        }
+                        entry = zip.nextEntry
+                    }
+                }
+            }
+            Log.e(TAG, "API 29+ exec preload is missing from the bundled bootstrap")
+        } catch (error: Exception) {
+            temporary.delete()
+            Log.e(TAG, "Failed to restore API 29+ exec preload: ${error.message}", error)
+        }
     }
 
     private fun ensureSocketHookPrebuilt() {
@@ -944,23 +1021,23 @@ class LinuxRuntime(private val context: Context) {
         val clang = File(prefixDir, "bin/clang")
         if (clang.exists()) {
             Log.i(TAG, "Compiling socket_hook.c natively using clang...")
-            val compileCmd = listOf(
-                clang.absolutePath,
+            val compileArgs = listOf(
                 "-shared", "-fPIC",
                 hookBuildC.absolutePath,
                 "-I", tmpDir.absolutePath,
                 "-o", hookSo.absolutePath,
+                "-Wl,-z,max-page-size=16384",
+                "-Wl,-z,common-page-size=16384",
                 "-ldl", "-llog"
             )
             try {
-                val pb = ProcessBuilder(compileCmd)
+                val pb = termuxProcessBuilder(
+                    executable = clang,
+                    arguments = compileArgs,
+                    // Do not replace a library while it is mapped into clang.
+                    includeSocketHook = false,
+                )
                     .redirectErrorStream(true)
-                    .also {
-                        it.environment().clear()
-                        it.environment()["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
-                        it.environment()["PATH"] = "${prefixDir.absolutePath}/bin:${System.getenv("PATH")}"
-                        it.environment()["TMPDIR"] = tmpDir.absolutePath
-                    }
                 val process = pb.start()
                 val log = process.inputStream.bufferedReader().readText()
                 val exitCode = process.waitFor()
@@ -979,7 +1056,7 @@ class LinuxRuntime(private val context: Context) {
 
     // ── Environment Configuration ──
 
-    private fun getTermuxEnv(): Map<String, String> {
+    private fun getTermuxEnv(includeSocketHook: Boolean = true): Map<String, String> {
         val env = mutableMapOf<String, String>()
 
         env["ANDROID_DATA"] = System.getenv("ANDROID_DATA") ?: "/data"
@@ -988,12 +1065,29 @@ class LinuxRuntime(private val context: Context) {
 
         env["PREFIX"] = prefixDir.absolutePath
         env["TMPDIR"] = tmpDir.absolutePath
-        // proot-distro 5.x derives all container paths from these variables.
-        // Without them it falls back to Termux's original com.termux sandbox.
+        // termux-exec 2.x and proot-distro derive their paths and Android
+        // execution policy from these scoped variables.
+        env["ANDROID__BUILD_VERSION_SDK"] = Build.VERSION.SDK_INT.toString()
+        env["TERMUX_APP__DATA_DIR"] = context.applicationInfo.dataDir
+        env["TERMUX_APP__LEGACY_DATA_DIR"] = "/data/data/${context.packageName}"
+        env["TERMUX_APP__FILES_DIR"] = baseDir.absolutePath
         env["TERMUX_APP__PACKAGE_NAME"] = context.packageName
+        env["TERMUX_APP__TARGET_SDK"] = context.applicationInfo.targetSdkVersion.toString()
+        env["TERMUX_APP__UID"] = context.applicationInfo.uid.toString()
+        env["TERMUX__ROOTFS"] = baseDir.absolutePath
+        env["TERMUX__ROOTFS_DIR"] = baseDir.absolutePath
         env["TERMUX__PREFIX"] = prefixDir.absolutePath
         env["TERMUX__HOME"] = homeDir.absolutePath
         env["TERMUX_VERSION"] = "DroidDesk"
+        env["TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE"] =
+            if (usesSystemLinkerExec()) "force" else "disable"
+        runCatching {
+            File("/proc/self/attr/current").readText()
+                .trim { it.isWhitespace() || it == '\u0000' }
+        }
+            .getOrNull()
+            ?.takeIf(String::isNotEmpty)
+            ?.let { env["TERMUX__SE_PROCESS_CONTEXT"] = it }
         env["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
         env["PATH"] = listOf(
             "${prefixDir.absolutePath}/bin",
@@ -1046,9 +1140,23 @@ class LinuxRuntime(private val context: Context) {
         env["DPKG_ADMINDIR"] = "${prefixDir.absolutePath}/var/lib/dpkg"
         env["APT_CONFIG"] = "${prefixDir.absolutePath}/etc/apt/apt.conf.d/99-droiddesk-paths.conf"
 
-        val hookSo = File(prefixDir, "lib/libsocket_hook.so")
-        if (hookSo.exists()) {
-            env["LD_PRELOAD"] = hookSo.absolutePath
+        val preloadLibraries = mutableListOf<File>()
+        val termuxExecPreload = File(
+            libDir,
+            if (usesSystemLinkerExec()) TERMUX_EXEC_LINKER_PRELOAD else TERMUX_EXEC_DIRECT_PRELOAD,
+        )
+        if (termuxExecPreload.isFile) {
+            preloadLibraries += termuxExecPreload
+        } else if (usesSystemLinkerExec()) {
+            Log.e(TAG, "Missing required Termux exec preload: ${termuxExecPreload.absolutePath}")
+        }
+
+        val hookSo = File(libDir, "libsocket_hook.so")
+        if (includeSocketHook && hookSo.isFile) {
+            preloadLibraries += hookSo
+        }
+        if (preloadLibraries.isNotEmpty()) {
+            env["LD_PRELOAD"] = preloadLibraries.joinToString(":") { it.absolutePath }
         }
 
         return env
@@ -1501,19 +1609,15 @@ class LinuxRuntime(private val context: Context) {
                 </busconfig>
                 """.trimIndent() + "\n",
             )
-            val dbusCmd = listOf(
-                File(prefixDir, "bin/dbus-daemon").absolutePath,
+            val dbusBin = File(prefixDir, "bin/dbus-daemon")
+            val dbusArgs = listOf(
                 "--config-file=${dbusConfig.absolutePath}",
                 "--nofork",
                 "--nopidfile"
             )
-            val startedDbus = ProcessBuilder(dbusCmd)
+            val startedDbus = termuxProcessBuilder(dbusBin, dbusArgs)
                 .directory(homeDir.apply { mkdirs() })
                 .redirectErrorStream(true)
-                .also { pb ->
-                    pb.environment().clear()
-                    pb.environment().putAll(getTermuxEnv())
-                }
                 .start()
             dbusProcess = startedDbus
 
@@ -1589,16 +1693,11 @@ class LinuxRuntime(private val context: Context) {
 
         Log.i(TAG, "Starting native Termux session for $selectedDesktop")
 
-        val bashBin = File(prefixDir, "bin/bash").absolutePath
-        val command = listOf(bashBin, "-c", runScript)
+        val bashBin = File(prefixDir, "bin/bash")
 
-        val startedSession = ProcessBuilder(command)
+        val startedSession = termuxProcessBuilder(bashBin, listOf("-c", runScript))
             .directory(homeDir.apply { mkdirs() })
             .redirectErrorStream(true)
-            .also { pb ->
-                pb.environment().clear()
-                pb.environment().putAll(getTermuxEnv())
-            }
             .start()
         sessionProcess = startedSession
 
@@ -1650,19 +1749,14 @@ class LinuxRuntime(private val context: Context) {
 
         compileSocketHook()
 
-        val bashBin = File(prefixDir, "bin/bash").absolutePath
-        val fullCommand = listOf(bashBin, "-c", command)
+        val bashBin = File(prefixDir, "bin/bash")
 
         return try {
             Log.d(TAG, "Executing command natively: $command")
 
-            val process = ProcessBuilder(fullCommand)
+            val process = termuxProcessBuilder(bashBin, listOf("-c", command))
                 .directory(prefixDir)
                 .redirectErrorStream(true)
-                .also { pb ->
-                    pb.environment().clear()
-                    pb.environment().putAll(getTermuxEnv())
-                }
                 .start()
 
             activeCommandProcess = process

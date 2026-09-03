@@ -9,6 +9,15 @@ add_library(
     compositor_jni.cpp
 )
 
+# Android 16 devices may use a 16 KiB memory page size. Keep every LOAD
+# segment compatible even when this project is built with an older NDK.
+target_link_options(
+    droiddesk_compositor
+    PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+)
+
 # Search for standard Android libraries
 find_library(log-lib log)
 find_library(android-lib android)

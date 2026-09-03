@@ -1,5 +1,6 @@
 package com.termux.x11;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Context;
 import android.os.Handler;
@@ -74,7 +75,7 @@ public class MainActivity extends Activity {
             metrics.widthPixels = 1920;
             metrics.heightPixels = 1080;
             metrics.density = 2.0f;
-            metrics.densityDpi = 320;
+            metrics.densityDpi = DisplayMetrics.DENSITY_XHIGH;
         }
     }
     
@@ -84,8 +85,10 @@ public class MainActivity extends Activity {
         return prefs;
     }
     
+    @SuppressLint("GestureBackNavigation")
     public boolean handleKey(KeyEvent event) {
-        // Let Android dismiss the soft keyboard and handle system navigation.
+        // This stub only filters physical key events delivered by LorieView.
+        // DesktopActivity owns system navigation, including predictive back.
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK)
             return false;
         return keyHandler != null && keyHandler.handle(event);

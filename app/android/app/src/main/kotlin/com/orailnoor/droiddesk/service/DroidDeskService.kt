@@ -1,5 +1,6 @@
 package com.orailnoor.droiddesk.service
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -44,7 +45,7 @@ class DroidDeskService : Service() {
             NOTIFICATION_ID,
             notification,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             } else {
                 0
             }
@@ -105,13 +106,15 @@ class DroidDeskService : Service() {
 
     // ── Wake Lock ──
 
+    @SuppressLint("WakelockTimeout")
     private fun acquireWakeLock() {
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "DroidDesk::LinuxRuntime"
         ).apply {
-            acquire(Long.MAX_VALUE)  // Keep CPU alive
+            // This service owns the lock and always releases it in onDestroy().
+            acquire()
         }
     }
 
