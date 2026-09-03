@@ -49,6 +49,28 @@ DroidDesk is also available as a standalone Android application that completely 
 
 Download the latest release APK from the Releases tab and sideload it to begin.
 
+### Android 16 and Xiaomi HyperOS 3
+
+The standalone app is built with `compileSdk 36` and `targetSdk 36`. Its Android
+16 compatibility baseline includes API level 36 build `BP2A.250605.031.A3`,
+16 KiB memory-page devices, predictive back, and edge-to-edge windows.
+
+HyperOS applies additional background controls that Android apps cannot change
+programmatically. For reliable long-running desktop sessions on Xiaomi devices:
+
+1. Allow DroidDesk notifications when Android asks.
+2. Open **Settings → Apps → Permissions → Background autostart** and enable
+   DroidDesk.
+3. In DroidDesk's app battery settings, choose **No restrictions**.
+4. Lock DroidDesk in the recent-apps screen when leaving a desktop session
+   running for a long time.
+5. If your device exposes a child-process restriction in Developer options,
+   disable it for desktop sessions that run many Linux processes.
+
+DroidDesk requests Android's battery-optimization exemption from its settings
+screen. The HyperOS autostart and recent-app controls still require a one-time
+user choice.
+
 ## Requirements
 
 - Any Android phone (ARM64)

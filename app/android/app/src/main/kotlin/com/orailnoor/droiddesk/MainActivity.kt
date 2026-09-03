@@ -1,13 +1,15 @@
 package com.orailnoor.droiddesk
 
+import android.Manifest
+import android.content.Context
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Build
 import android.os.PowerManager
-import android.content.Context
 import android.net.Uri
 import android.provider.Settings
 import com.orailnoor.droiddesk.service.DroidDeskService
@@ -25,6 +27,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL = "com.droiddesk/core"
         private const val TAG = "MainActivity"
+        private const val NOTIFICATION_PERMISSION_REQUEST = 1002
     }
 
     private lateinit var linuxRuntime: LinuxRuntime
@@ -463,8 +466,7 @@ class MainActivity : FlutterActivity() {
 
                 // ── System ──
                 "requestBatteryOptimization" -> {
-                    requestIgnoreBatteryOptimization()
-                    result.success(true)
+                    result.success(requestIgnoreBatteryOptimization())
                 }
 
                 "isBatteryOptimized" -> {
@@ -492,6 +494,7 @@ class MainActivity : FlutterActivity() {
     // ── Foreground Service ──
 
     private fun startForegroundService() {
+        requestNotificationPermissionIfNeeded()
         val intent = Intent(this, DroidDeskService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -505,6 +508,23 @@ class MainActivity : FlutterActivity() {
         stopService(intent)
     }
 
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        runOnUiThread {
+            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    NOTIFICATION_PERMISSION_REQUEST,
+                )
+            }
+        }
+    }
+
     // ── Battery Optimization ──
 
     private fun isBatteryOptimized(): Boolean {
@@ -512,12 +532,26 @@ class MainActivity : FlutterActivity() {
         return !pm.isIgnoringBatteryOptimizations(packageName)
     }
 
-    private fun requestIgnoreBatteryOptimization() {
-        if (isBatteryOptimized()) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:$packageName")
-            }
-            startActivity(intent)
+    private fun requestIgnoreBatteryOptimization(): Boolean {
+        if (!isBatteryOptimized()) return true
+
+        val packageUri = Uri.parse("package:$packageName")
+        val requestIntent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = packageUri
+        }
+
+        return runCatching {
+            startActivity(requestIntent)
+            true
+        }.getOrElse { error ->
+            // Some HyperOS releases do not expose the standard per-app dialog.
+            // App details still provides a stable route into Xiaomi's battery and
+            // background-activity controls without relying on private MIUI APIs.
+            Log.w(TAG, "Battery exemption dialog unavailable; opening app settings", error)
+            runCatching {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri))
+                true
+            }.getOrDefault(false)
         }
     }
 

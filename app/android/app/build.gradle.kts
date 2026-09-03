@@ -7,7 +7,9 @@ plugins {
 
 android {
     namespace = "com.orailnoor.droiddesk"
-    compileSdk = flutter.compileSdkVersion
+    // Android 16. Using explicit values here prevents a Flutter SDK upgrade or
+    // downgrade from silently changing the platform contract we ship against.
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     buildFeatures {
@@ -25,8 +27,8 @@ android {
 
     defaultConfig {
         applicationId = "com.orailnoor.droiddesk"
-        minSdk = 28  // Downgraded to 28 to bypass W^X (Write XOR Execute) restrictions on app data
-        targetSdk = 28 // API 28 completely disables the Android 10+ execve() block
+        minSdk = 28
+        targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
